@@ -54,7 +54,9 @@ html, body {
 .topbar {
   position: sticky;
   top: 0;
-  z-index: 10;
+  /* Above the modal (60) so the live status stays readable while the
+     hardware-detection dialog is open. */
+  z-index: 70;
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
@@ -140,6 +142,21 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px; display: grid; gap: 18p
 .alert.err {
   background: color-mix(in srgb, var(--err) 12%, transparent);
   border-color: color-mix(in srgb, var(--err) 40%, transparent);
+}
+
+/* Page-level status banner: float it above the modal backdrop (like the
+   toast) so an alert raised while the detection dialog is open stays
+   readable.  backdrop-filter keeps the translucent warning tint legible. */
+#alert {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(940px, calc(100% - 40px));
+  margin: 0;
+  z-index: 90;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
 }
 .hidden { display: none !important; }
 
@@ -316,7 +333,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
 .toast {
   position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
   background: var(--text); color: var(--bg); padding: 9px 18px; border-radius: 9px;
-  font-size: 13px; box-shadow: var(--shadow); z-index: 50;
+  font-size: 13px; box-shadow: var(--shadow); z-index: 80;
 }
 .toast.err { background: var(--err); color: #fff; }
 
@@ -326,6 +343,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
   position: fixed;
   inset: 0;
   z-index: 60;
+  /* Leave the sticky top bar (z-index 70) and the floating #alert (76px,
+     z-index 90) unobstructed. */
+  padding-top: 136px;
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -470,7 +491,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
 
 /* The detection wizard carries two long lists, so it gets the room to show
    them next to each other instead of one below the other. */
-.modal-box-wide { width: min(1240px, 100%); max-height: 92vh; }
+.modal-box-wide { width: min(1240px, 100%); max-height: calc(100vh - 176px); }
 .modal-box-wide .modal-body { padding: 16px 20px; }
 
 .setup-grid {
