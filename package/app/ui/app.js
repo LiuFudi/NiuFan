@@ -388,6 +388,10 @@ function buildFanCard(fan, channelInfo) {
   card.className = 'fan';
   card.dataset.channel = String(fan.channel);
   const missing = !channelInfo || !channelInfo.present;
+  // qnap8528 (QNAP IT8528 EC) publishes pwmN but no pwmN_enable: there is no
+  // BIOS automatic mode to fall back to, so keep the option visible but
+  // unselectable instead of silently rewriting an existing "auto" config.
+  const enableSupported = !channelInfo || channelInfo.enable_supported !== false;
 
   card.innerHTML = '' +
     '<div class="fan-head">' +
@@ -415,9 +419,13 @@ function buildFanCard(fan, channelInfo) {
       '<div class="fan-controls">' +
         '<div class="field"><label>调速模式</label>' +
           '<select class="fan-mode">' +
-            Object.keys(MODE_LABELS).map((key) =>
-              '<option value="' + key + '"' + (fan.mode === key ? ' selected' : '') + '>' +
-              MODE_LABELS[key] + '</option>').join('') +
+            Object.keys(MODE_LABELS).map((key) => {
+              const unsupported = !enableSupported && key === 'auto';
+              return '<option value="' + key + '"' +
+                (fan.mode === key ? ' selected' : '') +
+                (unsupported ? ' disabled' : '') + '>' +
+                MODE_LABELS[key] + (unsupported ? '（不支持）' : '') + '</option>';
+            }).join('') +
           '</select></div>' +
         '<div class="field"><span class="field-label">温度来源</span>' +
           (function () {
@@ -614,7 +622,11 @@ function updateLive() {
     health.className = 'pulse err';
     subtitle.textContent = '未找到风扇控制器';
     const others = status.unsupported || [];
-    if (others.length) {
+    if (status.third_party_ignored) {
+      showAlert('检测到第三方软件驱动控制器 ' + status.third_party_ignored +
+        '，当前是「飞牛驱动」模式，已按设置忽略。请点右上角「硬件检测」，' +
+        '切换到「软件驱动」后重新检测。', true);
+    } else if (others.length) {
       showAlert('没有找到带 PWM 控制的风扇控制器，但检测到其它控制器：' +
         others.map((o) => o.name + '（' + o.hwmon + '）').join('、') +
         '。点右上角「硬件检测」查看详情，并可导出诊断日志反馈。', true);
@@ -895,18 +907,19 @@ function failureHtml() {
 }
 
 function setSetupFailure(kind, detail) {
+  const modeLabel = (status && status.driver_mode_label) || '当前驱动';
   if (kind === 'B') {
     setupState.failure = {
       kind: kind,
-      title: '软件驱动仍无法识别风扇控制器。',
+      title: modeLabel + '仍无法识别风扇控制器。',
       detail: detail
     };
   } else {
     setupState.failure = {
       kind: kind,
       title: setupState.autoSwitchedFromFnos
-        ? '飞牛驱动无效，已切换到软件驱动，但仍无法完成有效标定。'
-        : '软件驱动仍无法完成有效标定。',
+        ? '飞牛驱动标定无效，已尝试切换到软件驱动，但仍无法完成有效标定。'
+        : modeLabel + '仍无法完成有效标定。',
       detail: detail
     };
   }
@@ -1172,7 +1185,11 @@ function renderSetup() {
         (controllable ? '<span class="tag yes">是</span>' : '<span class="tag warn">否（仅监控）</span>') +
       '</b></div>' +
     '</div>' +
-    (ctrl && ctrl.note ? '<div class="alert">' + esc(ctrl.note) + '</div>' : '') +
+    (ctrl && ctrl.note
+      ? (ctrl.controllable
+          ? '<div class="curve-hint">' + esc(ctrl.note) + '</div>'
+          : '<div class="alert">' + esc(ctrl.note) + '</div>')
+      : '') +
     (others.length
       ? '<div class="alert">还检测到其它带 PWM 的控制器，但未被使用：' +
         others.map((o) => esc(o.name + '（' + o.hwmon + '）')).join('、') + '</div>'
@@ -1356,10 +1373,12 @@ async function runProbe() {
     await probeOnce();
     let summary = setupResultsSummary();
 
-    // The FnOS hwmon path is tried first on a fresh install.  If it sees fans
-    // but none of them follow the duty cycle, try the direct Super-I/O backend
-    // once, then calibrate again automatically.
+    // A controller without pwmN_enable (qnap8528) has no raw Super-I/O
+    // backend to switch to, so switching would simply lose the controller.
+    const noRawBackend = !!(status && status.controller &&
+                            status.controller.has_enable === false);
     if ((!summary.detected.length || !summary.responsive.length)
+        && !noRawBackend
         && status && status.driver_mode !== 'software'
         && !setupState.autoSwitchTried) {
       setupState.autoSwitchTried = true;
@@ -1378,17 +1397,23 @@ async function runProbe() {
       if (!summary.detected.length) {
         const active = (status && status.active_identity) ||
           hardware.active_identity;
+        const modeLabel = (status && status.driver_mode_label) || '当前驱动';
         setSetupFailure(
           'B',
           active
-            ? '软件驱动无法从当前设备获得可标定的 PWM 通道，' +
+            ? modeLabel + '无法从当前设备获得可标定的 PWM 通道，' +
               '已识别到 ' + (active.model || active.chip_id || '未知设备') + '。'
-            : '软件驱动无法识别当前设备，也没有获得可标定的 PWM 通道。');
+            : modeLabel + '无法识别当前设备，也没有获得可标定的 PWM 通道。');
       } else {
+        const modeLabel = (status && status.driver_mode_label) || '当前驱动';
+        const rows = summary.detected.map((item) =>
+          'CH' + item.channel + '（' +
+          (item.rpm_high == null ? '–' : item.rpm_high) + ' → ' +
+          (item.rpm_low == null ? '–' : item.rpm_low) + ' RPM）').join('、');
         setSetupFailure(
           'A',
-          '软件驱动已识别到 ' + summary.detected.length +
-          ' 路有转速的风扇，但 100% 与 0% 标定没有得到转速变化。');
+          modeLabel + '已识别到 ' + summary.detected.length +
+          ' 路有转速的风扇（' + rows + '），但 100% 与 0% 标定没有得到转速变化。');
       }
     } else {
       setupState.failure = null;

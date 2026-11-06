@@ -72,10 +72,13 @@ class ControllerProfile:
     """What we need to know about one fan-controller driver family."""
 
     __slots__ = ("key", "label", "prefixes", "manual", "auto", "controllable",
-                 "modules", "note", "tested")
+                 "modules", "note", "tested", "has_enable", "invert_pwm",
+                 "software_driver", "probe_settle")
 
     def __init__(self, key, label, prefixes, manual=1, auto=2,
-                 controllable=True, modules=(), note="", tested=False):
+                 controllable=True, modules=(), note="", tested=False,
+                 has_enable=True, invert_pwm=False, software_driver=False,
+                 probe_settle=None):
         self.key = key
         self.label = label
         self.prefixes = tuple(prefixes)
@@ -85,6 +88,22 @@ class ControllerProfile:
         self.modules = tuple(modules)
         self.note = note
         self.tested = tested
+        #: False for controllers that expose ``pwmN`` but no ``pwmN_enable``
+        #: (the QNAP IT8528 EC module is the one we know about).  Such a
+        #: controller has no BIOS automatic mode to fall back to.
+        self.has_enable = has_enable
+        #: True when the driver's pwm value runs backwards: 0 means full speed
+        #: and 255 the slowest.  Kept for completeness; qnap8528 is *not* one
+        #: of these (measured: 0 = stopped, 255 = ~1600 RPM).
+        self.invert_pwm = invert_pwm
+        #: True for controllers delivered by a third-party kernel module
+        #: (qnap8528).  They belong to the "software driver" mode, not to the
+        #: drivers fnOS itself ships, so the "fnOS driver" mode must ignore them.
+        self.software_driver = software_driver
+        #: Seconds the fan needs to reach a new speed before a calibration
+        #: sample is meaningful.  QNAP's EC is slow; the default 2.5-3.5 s read
+        #: the *previous* speed and made 100 %/0 % look reversed.
+        self.probe_settle = probe_settle
 
     def as_dict(self):
         return {
@@ -94,6 +113,10 @@ class ControllerProfile:
             "auto": self.auto,
             "controllable": self.controllable,
             "tested": self.tested,
+            "has_enable": self.has_enable,
+            "invert_pwm": self.invert_pwm,
+            "software_driver": self.software_driver,
+            "probe_settle": self.probe_settle,
             "note": self.note,
         }
 
@@ -139,6 +162,22 @@ PROFILES = (
                            # newer silicon rejects it, and restore_channel()
                            # falls back to full speed in that case
         modules=("it87",),
+    ),
+    ControllerProfile(
+        key="qnap8528",
+        label="QNAP IT8528 EC（qnap8528 内核模块）",
+        prefixes=("qnap8528",),
+        manual=1, auto=2,
+        has_enable=False,
+        software_driver=True,
+        probe_settle=7.0,
+        modules=("qnap8528",),
+        note="QNAP 的 IT8528 EC 由第三方内核模块 qnap8528 暴露为 hwmon。"
+             "该驱动只提供 pwmN，没有 pwmN_enable；pwm 方向与 hwmon 一致"
+             "（0 = 停转、255 = 全速），但 EC 响应较慢，标定会等待约 7 秒；"
+             "同一组风扇共享一个 PWM 通道，没有可回退的 BIOS 自动模式，"
+             "停止调速时只能写回接管前的占空比（没有记录时用全速），"
+             "无法真正「交还 BIOS」。",
     ),
     ControllerProfile(
         key="f71882fg",
@@ -198,6 +237,9 @@ GENERIC_PROFILE = ControllerProfile(
 CANDIDATE_MODULES = (
     "nct6775", "it87", "f71882fg", "f71805f", "w83627ehf", "w83627hf",
     "sch5627", "sch5636", "nct6683",
+    # Third-party DKMS module for QNAP IT8528 EC boards.  It refuses to bind
+    # when no IT8528 is present, so loading it on other machines is harmless.
+    "qnap8528",
 )
 
 
@@ -307,6 +349,20 @@ def hwmon_controller():
             fallback = (path, name, GENERIC_PROFILE)
     if fallback is not None:
         return fallback
+    return None, None, None
+
+
+def third_party_controller():
+    """Locate a hwmon controller supplied by a third-party kernel module.
+
+    qnap8528 is the known case.  It is exposed through hwmon like any other
+    controller, but the module is not shipped with fnOS, so it belongs to the
+    "software driver" mode instead of the "fnOS driver" mode.
+    """
+    for path, name in hwmon_nodes():
+        profile = profile_for(name)
+        if profile is not None and profile.software_driver:
+            return path, name, profile
     return None, None, None
 
 
@@ -457,10 +513,21 @@ def find_controller(preference="auto"):
     if preference not in ("auto", "fnos", "software"):
         preference = "auto"
     path, name, profile = hwmon_controller()
+    third_party = profile is not None and profile.software_driver
     if preference in ("auto", "fnos") and path is not None:
+        if preference == "fnos" and third_party:
+            # "fnOS driver" means only the drivers fnOS itself ships.  A
+            # third-party module (qnap8528) belongs to software mode and must
+            # not be silently driven under the fnOS label.
+            return None, None, None
         return path, name, profile
     if preference == "fnos":
         return None, None, None
+    # Software mode: a third-party hwmon module already owns the EC, so use it
+    # rather than fighting it with the raw Super-I/O backend.
+    tp_path, tp_name, tp_profile = third_party_controller()
+    if tp_path is not None:
+        return tp_path, tp_name, tp_profile
     refresh_hardware_identity(
         force=preference == "software",
         include_superio=preference == "software" or path is None)
@@ -510,7 +577,12 @@ def ensure_modules(log=None, preference="auto"):
     """
     notes = []
     if preference == "software":
-        refresh_hardware_identity(log, force=True, include_superio=True)
+        # Third-party hwmon modules (qnap8528) are part of software mode;
+        # only fall back to the raw Super-I/O backend when none is present.
+        if third_party_controller()[0] is None:
+            load_module("qnap8528", log)
+        if third_party_controller()[0] is None:
+            refresh_hardware_identity(log, force=True, include_superio=True)
         load_module("drivetemp", log)
         return notes
     if hwmon_controller()[0] is None:
@@ -558,6 +630,11 @@ class FanChannel:
         self.path_enable = os.path.join(hwmon, "pwm%d_enable" % index)
         self.path_temp_sel = os.path.join(hwmon, "pwm%d_temp_sel" % index)
         self.path_mode = os.path.join(hwmon, "pwm%d_mode" % index)
+        # The QNAP qnap8528 driver exposes pwmN without pwmN_enable; writing an
+        # enable value there would fail on every tick.  Decide once, when the
+        # channel is built, and let the rest of the code skip what is absent.
+        self._enable_supported = (transport is not None
+                                  or os.path.exists(self.path_enable))
         self.peak_rpm = 0
         self.low_rpm = None
         self.last_error = None
@@ -578,16 +655,30 @@ class FanChannel:
 
     @property
     def duty(self):
-        """Current PWM duty 0-255 as reported by the chip."""
+        """Current PWM duty 0-255 in hwmon convention.
+
+        qnap8528's register runs backwards (0 = full speed, 255 = slowest), so
+        the value is inverted here to keep every caller on 0 = stopped,
+        255 = full speed.
+        """
         if self.transport is not None:
-            return self.transport.read_duty(self.index)
-        return read_int(self.path_pwm)
+            value = self.transport.read_duty(self.index)
+        else:
+            value = read_int(self.path_pwm)
+        if value is None or not self.profile.invert_pwm:
+            return value
+        return 255 - value
 
     @property
     def enable(self):
         if self.transport is not None:
             return self.transport.read_enable(self.index)
         return read_int(self.path_enable)
+
+    @property
+    def enable_supported(self):
+        """Whether this controller has a ``pwmN_enable`` attribute at all."""
+        return self._enable_supported
 
     @property
     def present(self):
@@ -640,6 +731,7 @@ class FanChannel:
             "rpm": self.rpm,
             "duty": self.duty,
             "enable": self.enable,
+            "enable_supported": self.enable_supported,
             "present": self.present,
             "rpm_min_seen": self.low_rpm,
             "rpm_max_seen": self.peak_rpm or None,
@@ -655,20 +747,28 @@ class FanChannel:
     def set_manual(self, duty):
         """Drive the header from the manual PWM register."""
         duty = max(0, min(255, int(duty)))
-        self.write_enable(self.profile.manual)
+        if self.enable_supported:
+            self.write_enable(self.profile.manual)
         self.write_duty(duty)
 
     def set_auto(self):
         """Select the chip's own automatic fan curve, if the driver has one."""
+        if not self.enable_supported:
+            raise OSError("该控制器没有 pwmN_enable，无法切换到 BIOS 自动模式")
         self.write_enable(self.profile.auto)
 
     def write_enable(self, value):
+        if not self.enable_supported:
+            raise OSError("该控制器没有 pwmN_enable")
         if self.transport is not None:
             self.transport.write_enable(self.index, value)
         else:
             write_text(self.path_enable, value)
 
     def write_duty(self, value):
+        value = max(0, min(255, int(value)))
+        if self.profile.invert_pwm:
+            value = 255 - value
         if self.transport is not None:
             self.transport.write_duty(self.index, value)
         else:
@@ -739,6 +839,9 @@ def restore_channel(channel, snapshot=None, log=None):
             channel.write_duty(max(0, min(255, int(duty))))
         if enable is not None:
             channel.write_enable(int(enable))
+        if duty is not None or enable is not None:
+            # A controller without pwmN_enable (qnap8528) still has a duty to
+            # restore; returning here keeps us from escalating to full speed.
             return "enable=%s duty=%s" % (enable, duty)
     try:
         channel.set_auto()
@@ -777,16 +880,25 @@ def restore_all_to_auto(log=None):
 PROBE_DUTIES = (76, 255)
 
 
-def _sample_peak(channel, duration, sample=0.3):
-    """Highest tach reading over ``duration`` seconds."""
-    peak = 0
+def _sample_steady(channel, duration, sample=0.3):
+    """Median tach reading over ``duration`` seconds.
+
+    Taking the peak captured the speed the fan was coming *from* while it
+    spun down, which made 0 % look faster than 100 % on slow EC drivers such
+    as qnap8528.  The median of the settled window is what the fan is doing
+    now.
+    """
+    values = []
     deadline = time.time() + duration
     while time.time() < deadline:
         time.sleep(sample)
         value = channel.rpm
-        if value and value > peak:
-            peak = value
-    return peak
+        if value is not None:
+            values.append(value)
+    if not values:
+        return 0
+    values.sort()
+    return values[len(values) // 2]
 
 
 def diagnose_unresponsive(channel, entry):
@@ -807,7 +919,24 @@ def diagnose_unresponsive(channel, entry):
             "不响应占空比写入，可以切到 PWM 模式后重测：echo 1 > %s"
             % (index, channel.path_mode))
 
-    if entry.get("enable_writable") is False:
+    if not channel.enable_supported:
+        # Controllers without pwmN_enable (qnap8528) select manual mode by the
+        # pwmN write itself.  Saying "the driver refused enable" here would be
+        # wrong, and sending the user back to the BIOS would be a dead end.
+        if entry.get("pwm_writable") is False:
+            hints.append("写 pwm%d 被驱动拒绝（权限或驱动不支持）。" % index)
+        elif (readback is not None and high is not None
+              and abs(readback - high) > 2):
+            hints.append(
+                "写入占空比 %s 但读回 %s：寄存器没有接受写入，"
+                "说明驱动或芯片忽略了它。" % (high, readback))
+        else:
+            hints.append(
+                "该控制器没有 pwmN_enable，写 pwmN 本身就会让驱动切换到手动模式；"
+                "寄存器写入与读回都正常但转速不变，问题多半在风扇或接线："
+                "3 针（DC）风扇插在 PWM 接头上时第 4 根 PWM 线不起作用，"
+                "风扇会恒速运转。换一个接头或换一把 4 针 PWM 风扇即可确认。")
+    elif entry.get("enable_writable") is False:
         hints.append(
             "写 pwm%d_enable=%s 被驱动拒绝，芯片没能进入手动模式，仍由 BIOS 的"
             "自动曲线控制 —— 这种情况下写占空比不会有任何效果。"
@@ -820,7 +949,7 @@ def diagnose_unresponsive(channel, entry):
             % (entry["enable_readback"], channel.profile.manual))
     elif entry.get("pwm_writable") is False:
         hints.append("写 pwm%d 被驱动拒绝（权限或驱动不支持）。" % index)
-    elif readback is not None and high is not None and readback != high:
+    elif readback is not None and high is not None and abs(readback - high) > 2:
         hints.append(
             "写入占空比 %s 但读回 %s：寄存器没有接受写入，说明驱动或芯片忽略了它。"
             % (high, readback))
@@ -874,6 +1003,9 @@ def probe_channels(channels, log=None, low_duty=PROBE_LOW_DUTY,
     """
     results = []
     for channel in channels:
+        settle = getattr(channel.profile, "probe_settle", None)
+        channel_high_settle = settle if settle else high_settle
+        channel_low_settle = settle if settle else low_settle
         snapshot = (channel.enable, channel.duty)
         entry = {
             "channel": channel.index,
@@ -901,13 +1033,19 @@ def probe_channels(channels, log=None, low_duty=PROBE_LOW_DUTY,
         if channel.controllable:
             try:
                 # point 1: full speed, capturing whether each write is accepted
-                try:
-                    channel.write_enable(channel.profile.manual)
-                    entry["enable_writable"] = True
-                    entry["enable_readback"] = channel.enable
-                except OSError as exc:
-                    entry["enable_writable"] = False
-                    entry["error"] = str(exc)
+                if channel.enable_supported:
+                    try:
+                        channel.write_enable(channel.profile.manual)
+                        entry["enable_writable"] = True
+                        entry["enable_readback"] = channel.enable
+                    except OSError as exc:
+                        entry["enable_writable"] = False
+                        entry["error"] = str(exc)
+                else:
+                    # No pwmN_enable (qnap8528): writing pwmN is itself what
+                    # selects manual mode inside the driver.  "Not applicable"
+                    # must not be reported as "the driver refused enable".
+                    entry["enable_writable"] = None
                 try:
                     channel.write_duty(high_duty)
                     entry["pwm_writable"] = True
@@ -916,8 +1054,8 @@ def probe_channels(channels, log=None, low_duty=PROBE_LOW_DUTY,
                     entry["pwm_writable"] = False
                     entry["error"] = entry["error"] or str(exc)
 
-                time.sleep(high_settle)
-                entry["rpm_high"] = _sample_peak(channel, window)
+                time.sleep(channel_high_settle)
+                entry["rpm_high"] = _sample_steady(channel, window)
 
                 # point 2: only worth doing when something actually spins
                 if entry["rpm_high"]:
@@ -925,8 +1063,8 @@ def probe_channels(channels, log=None, low_duty=PROBE_LOW_DUTY,
                         channel.write_duty(low_duty)
                     except OSError:
                         pass
-                    time.sleep(low_settle)
-                    entry["rpm_low"] = _sample_peak(channel, window)
+                    time.sleep(channel_low_settle)
+                    entry["rpm_low"] = _sample_steady(channel, window)
             except OSError as exc:
                 entry["error"] = entry["error"] or str(exc)
             finally:
