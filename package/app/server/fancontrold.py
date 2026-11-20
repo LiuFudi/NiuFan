@@ -192,7 +192,15 @@ class Controller:
         with self.lock:
             self.chip = chip
             self.profile = profile
-            self.channels = {c.index: c for c in fanhardware.fan_channels(profile, path)}
+            # Do not let fan_channels() re-discover a controller with its own
+            # auto fallback: in "fnOS driver" mode that silently brought back
+            # the third-party qnap8528 module this mode is supposed to ignore.
+            if path is None or profile is None:
+                self.channels = {}
+            else:
+                self.channels = {
+                    c.index: c
+                    for c in fanhardware.fan_channels(profile, path)}
             self.hardware_ready = bool(self.channels)
             self.controllable = any(c.controllable
                                     for c in self.channels.values())
@@ -200,6 +208,12 @@ class Controller:
             self.active_identity = active.as_dict() if active is not None else None
             if (isinstance(path, fanhardware.RawControllerSource)
                     and self.channels and self.controllable):
+                self.driver_mode = "software"
+                self.driver_mode_label = "软件驱动"
+            elif (isinstance(path, str) and profile is not None
+                  and profile.software_driver):
+                # Third-party kernel modules (qnap8528) are software drivers,
+                # not the drivers fnOS itself ships.
                 self.driver_mode = "software"
                 self.driver_mode_label = "软件驱动"
             elif isinstance(path, str):
@@ -560,20 +574,21 @@ class Controller:
         stale = time.time() - self.mode_at.get(index, 0.0) >= self.REASSERT_SECONDS
         if mode != "manual" or stale:
             previous_enable = None
-            if mode == "manual" and stale:
+            if channel.enable_supported and mode == "manual" and stale:
                 try:
                     previous_enable = channel.enable
                 except OSError:
                     pass
             if mode != "manual":
                 self._remember_original(channel)
-            # profile.manual, not a hard-coded 1: the value differs per driver
-            channel.write_enable(channel.profile.manual)
-            if (previous_enable is not None
-                    and previous_enable != channel.profile.manual):
-                self.log(
-                    "fan%d: firmware/BIOS reset manual mode "
-                    "(enable=%s), reasserted" % (index, previous_enable))
+            if channel.enable_supported:
+                # profile.manual, not a hard-coded 1: the value differs per driver
+                channel.write_enable(channel.profile.manual)
+                if (previous_enable is not None
+                        and previous_enable != channel.profile.manual):
+                    self.log(
+                        "fan%d: firmware/BIOS reset manual mode "
+                        "(enable=%s), reasserted" % (index, previous_enable))
             self.applied[index] = "manual"
             self.mode_at[index] = time.time()
             if mode != "manual":
@@ -583,8 +598,11 @@ class Controller:
             actual_duty = channel.duty
         except OSError:
             pass
+        # Allow a small readback error: qnap8528 stores the duty as a
+        # percentage and converts back, so writing 180 can read back as 178.
+        # Without the tolerance every tick would look like firmware override.
         overridden = (actual_duty is not None
-                      and actual_duty != duty
+                      and abs(actual_duty - duty) > 2
                       and self.written.get(index) == duty)
         if self.written.get(index) != duty or overridden:
             if overridden:
@@ -600,11 +618,25 @@ class Controller:
             self.written[index] = duty
 
     def _apply_auto(self, channel):
-        if self.applied.get(channel.index) != "auto":
-            self._remember_original(channel)
-            channel.set_auto()
+        if self.applied.get(channel.index) == "auto":
+            return
+        self._remember_original(channel)
+        if not channel.enable_supported:
+            # This controller has no pwmN_enable (qnap8528 / QNAP IT8528 EC),
+            # so there is no BIOS automatic mode to return to.  Put back the
+            # duty that was there before we took over; with no snapshot, full
+            # speed is the safe choice -- otherwise the fan would freeze at
+            # whatever the last curve value happened to be.
+            original = self.original.get(channel.index) or (None, None)
+            duty = original[1]
+            channel.write_duty(
+                255 if duty is None else max(0, min(255, int(duty))))
             self.applied[channel.index] = "auto"
             self.written.pop(channel.index, None)
+            return
+        channel.set_auto()
+        self.applied[channel.index] = "auto"
+        self.written.pop(channel.index, None)
 
     def _release(self, index):
         """Hand one channel back to the state it had before this app ran."""
@@ -640,6 +672,11 @@ class Controller:
                 "degraded": False,
                 "error": None,
             }
+            # Show the bound source even in manual / automatic mode: the fan
+            # is not steered by it then, but the reading is still useful on the
+            # card (and its absence looked like a broken sensor).
+            temperature = self._effective_temperature(fan["source"])
+            state["temperature"] = temperature
             try:
                 if not config["enabled"] or fan["mode"] == "auto":
                     self._apply_auto(channel)
@@ -649,8 +686,6 @@ class Controller:
                     state["percent"] = round(fan["manual_duty"] * 100.0 / 255.0, 1)
                     state["duty"] = fan["manual_duty"]
                 else:
-                    temperature = self._effective_temperature(fan["source"])
-                    state["temperature"] = temperature
                     if temperature is None:
                         # Every configured source is unavailable: fail safe.
                         duty = config["fail_safe_duty"]
@@ -964,6 +999,12 @@ class Controller:
                 "updated": self.updated,
                 "caller": self.last_identity,
                 "unsupported": fanhardware.detect_other_controllers(),
+                "third_party_ignored": (
+                    fanhardware.third_party_controller()[1]
+                    if (not self.hardware_ready
+                        and self.driver_preference == "fnos"
+                        and fanhardware.third_party_controller()[0] is not None)
+                    else None),
                 "locked": config["fail_safe_duty"] == 255 and self.degraded,
                 "sources": self._source_state(),
                 "source_list": self.source_list(),
@@ -1065,7 +1106,13 @@ class Controller:
         warnings = []
         if not drivable:
             active = fanhardware.hardware_identity()
-            if active is not None and channel_count == 0:
+            third_party = fanhardware.third_party_controller()
+            if third_party[0] is not None and self.driver_preference == "fnos":
+                warnings.append(
+                    "检测到第三方软件驱动控制器 %s，但当前是「飞牛驱动」模式，"
+                    "按设置已忽略。请切换到「软件驱动」后重新检测。"
+                    % third_party[1])
+            elif active is not None and channel_count == 0:
                 warnings.append(self.NO_BACKEND_WARNING % active.identity.model)
                 warnings.append(self.NO_BACKEND_REASONS)
             elif chip:

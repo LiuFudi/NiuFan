@@ -572,6 +572,276 @@ def main():
         check.case(channel.writes == [180]
                    and any("may be overriding" in line for line in logs),
                    "PWM 读回被外部改写时会重写并写入日志")
+
+        channel = FakeDutyChannel()
+        channel._duty = 178
+        controller = fancontrold.Controller(
+            "/tmp/niufan-r2-test.json", lambda _message: None)
+        controller.applied[2] = "manual"
+        controller.written[2] = 180
+        controller.mode_at[2] = fancontrold.time.time()
+        controller._apply_duty(channel, 180)
+        check.case(channel.writes == [],
+                   "PWM 读回与写入相差 ±2 以内不视为固件覆盖")
+
+    # --- qnap8528: QNAP IT8528 EC, pwmN without pwmN_enable --------------- #
+    qnap = fanhardware.profile_for("qnap8528")
+    check.case(qnap is not None and qnap.key == "qnap8528",
+               "hwmon 名称 qnap8528 映射到专用驱动家族")
+    check.case(qnap is not None and not qnap.has_enable,
+               "qnap8528 标记为没有 pwmN_enable")
+
+    # qnap8528 is a third-party kernel module: it belongs to software mode.
+    saved_hwmon = fanhardware.hwmon_controller
+    saved_third = fanhardware.third_party_controller
+    try:
+        fanhardware.hwmon_controller = lambda: (
+            "/sys/class/hwmon/hwmon9", "qnap8528", qnap)
+        fanhardware.third_party_controller = lambda: (
+            "/sys/class/hwmon/hwmon9", "qnap8528", qnap)
+        fnos_path, _n, _p = fanhardware.find_controller("fnos")
+        auto_path, _n2, auto_profile = fanhardware.find_controller("auto")
+        soft_path, _n3, soft_profile = fanhardware.find_controller("software")
+        check.case(fnos_path is None,
+                   "飞牛驱动模式忽略 qnap8528 第三方模块")
+        check.case(auto_path is not None and soft_path is not None
+                   and auto_profile is qnap and soft_profile is qnap,
+                   "自动 / 软件驱动模式识别 qnap8528")
+    finally:
+        fanhardware.hwmon_controller = saved_hwmon
+        fanhardware.third_party_controller = saved_third
+
+    # A "fnOS driver" refresh must not fall back to auto inside fan_channels(),
+    # which previously brought the ignored qnap8528 controller back.
+    saved_find2 = fanhardware.find_controller
+    saved_channels2 = fanhardware.fan_channels
+    saved_ensure2 = fanhardware.ensure_modules
+    channel_calls = []
+    try:
+        fanhardware.find_controller = lambda preference="auto": (None, None, None)
+        fanhardware.fan_channels = lambda profile=None, hwmon=None: (
+            channel_calls.append((profile, hwmon)) or [])
+        fanhardware.ensure_modules = lambda *_args, **_kwargs: []
+        fnos_controller = fancontrold.Controller(
+            "/tmp/niufan-fnos-mode.json", lambda _message: None)
+        fnos_controller.refresh_hardware("fnos")
+        check.case(fnos_controller.channels == {} and not channel_calls,
+                   "飞牛驱动模式无控制器时不再回退到 qnap8528")
+    finally:
+        fanhardware.find_controller = saved_find2
+        fanhardware.fan_channels = saved_channels2
+        fanhardware.ensure_modules = saved_ensure2
+
+    class FakeQnapChannel:
+        index = 1
+        controllable = True
+        present = True
+
+        def as_dict(self):
+            return {"channel": 1, "controllable": True, "present": True}
+
+    saved_find = fanhardware.find_controller
+    saved_channels = fanhardware.fan_channels
+    saved_ensure = fanhardware.ensure_modules
+    try:
+        fanhardware.find_controller = lambda preference="auto": (
+            "/sys/class/hwmon/hwmon9", "qnap8528", qnap)
+        fanhardware.fan_channels = lambda profile=None, hwmon=None: [
+            FakeQnapChannel()]
+        fanhardware.ensure_modules = lambda *_args, **_kwargs: []
+        mode_controller = fancontrold.Controller(
+            "/tmp/niufan-qnap-mode.json", lambda _message: None)
+        mode_controller.refresh_hardware()
+        check.case(mode_controller.driver_mode == "software"
+                   and mode_controller.driver_mode_label == "软件驱动",
+                   "qnap8528 归类为软件驱动")
+    finally:
+        fanhardware.find_controller = saved_find
+        fanhardware.fan_channels = saved_channels
+        fanhardware.ensure_modules = saved_ensure
+
+    import shutil
+    import tempfile
+
+    workdir = tempfile.mkdtemp(prefix="niufan-qnap-")
+    try:
+        with open(os.path.join(workdir, "pwm1"), "w") as handle:
+            handle.write("128")
+        with open(os.path.join(workdir, "fan1_input"), "w") as handle:
+            handle.write("1200")
+        qnap_channel = fanhardware.FanChannel(workdir, 1, qnap)
+        check.case(not qnap_channel.enable_supported,
+                   "缺少 pwm1_enable 时识别为无 enable 控制器")
+        qnap_channel.set_manual(255)
+        with open(os.path.join(workdir, "pwm1")) as handle:
+            full_speed = handle.read()
+        check.case(full_speed == "255" and qnap_channel.duty == 255,
+                   "qnap8528 方向与 hwmon 一致：100%% 写 255（%s）" % full_speed)
+        qnap_channel.set_manual(0)
+        with open(os.path.join(workdir, "pwm1")) as handle:
+            slowest = handle.read()
+        check.case(slowest == "0" and qnap_channel.duty == 0,
+                   "qnap8528 方向与 hwmon 一致：0%% 写 0（%s）" % slowest)
+        qnap_channel.set_manual(180)
+        with open(os.path.join(workdir, "pwm1")) as handle:
+            written = handle.read()
+        check.case(written == "180" and qnap_channel.duty == 180,
+                   "无 enable 控制器直接写 pwmN 调速（%s）" % written)
+        try:
+            qnap_channel.set_auto()
+            check.case(False, "无 enable 控制器调用 set_auto 抛 OSError")
+        except OSError:
+            check.case(True, "无 enable 控制器调用 set_auto 抛 OSError")
+        detail = fanhardware.restore_channel(qnap_channel, (None, 77))
+        with open(os.path.join(workdir, "pwm1")) as handle:
+            restored = handle.read()
+        check.case(restored == "77" and detail.startswith("enable=None"),
+                   "restore_channel 仍能写回无 enable 通道的占空比")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    class NoEnableChannel:
+        index = 3
+        profile = qnap
+        controllable = True
+        enable_supported = False
+
+        def __init__(self):
+            self.duty_value = 40
+            self.duty_writes = []
+            self.enable_writes = []
+
+        @property
+        def enable(self):
+            return None
+
+        @property
+        def duty(self):
+            return self.duty_value
+
+        def write_enable(self, value):
+            self.enable_writes.append(value)
+            raise AssertionError("无 enable 通道不应写 enable")
+
+        def write_duty(self, value):
+            self.duty_writes.append(value)
+            self.duty_value = value
+
+    qnap_controller = fancontrold.Controller(
+        "/tmp/niufan-qnap-test.json", lambda _message: None)
+    qnap_channel = NoEnableChannel()
+    qnap_controller._apply_duty(qnap_channel, 200)
+    check.case(qnap_channel.enable_writes == []
+               and qnap_channel.duty_writes == [200],
+               "控制循环对无 enable 通道只写占空比")
+
+    auto_channel = NoEnableChannel()
+    auto_controller = fancontrold.Controller(
+        "/tmp/niufan-qnap-test.json", lambda _message: None)
+    auto_controller._remember_original(auto_channel)
+    auto_channel.duty_value = 200
+    auto_controller._apply_auto(auto_channel)
+    check.case(auto_channel.duty_writes == [40],
+               "无 enable 控制器的自动模式写回接管前的占空比")
+
+    hints = fanhardware.diagnose_unresponsive(qnap_channel, {
+        "duty_high": 255,
+        "pwm_readback": 255,
+        "pwm_writable": True,
+        "enable_writable": None,
+        "enable_readback": None,
+        "pwm_mode": None,
+    })
+    check.case(not any("pwm1_enable" in line for line in hints),
+               "无 enable 控制器的诊断不再误报 enable 被拒绝")
+    check.case(any("没有 pwmN_enable" in line for line in hints),
+               "无 enable 控制器的诊断说明写法正确")
+
+    class ProbeChannel:
+        index = 1
+        profile = qnap
+        controllable = True
+        enable_supported = False
+
+        def __init__(self):
+            self.duty_value = 100
+            self.rpm_value = 900
+            self.enable_writes = []
+
+        @property
+        def rpm(self):
+            return self.rpm_value
+
+        @property
+        def duty(self):
+            return self.duty_value
+
+        @property
+        def enable(self):
+            return None
+
+        @property
+        def mode(self):
+            return None
+
+        @property
+        def temp_sel(self):
+            return None
+
+        @property
+        def temp_sel_label(self):
+            return None
+
+        def write_enable(self, value):
+            self.enable_writes.append(value)
+            raise AssertionError("无 enable 通道不应写 enable")
+
+        def write_duty(self, value):
+            self.duty_value = value
+            self.rpm_value = int(value) * 1607 // 255
+
+    saved_settle = qnap.probe_settle
+    qnap.probe_settle = 0
+    try:
+        probe_channel = ProbeChannel()
+        probe_results = fanhardware.probe_channels(
+            [probe_channel], None, high_settle=0, low_settle=0, window=0.01)
+        probe_entry = probe_results[0]
+        check.case(probe_entry["enable_writable"] is None
+                   and probe_channel.enable_writes == [],
+                   "标定对无 enable 通道不写 enable")
+        check.case(probe_entry["responsive"]
+                   and probe_entry["rpm_high"] == 1607
+                   and probe_entry["rpm_low"] == 0,
+                   "标定按 RPM 变化判定有效")
+
+        probe_dir = tempfile.mkdtemp(prefix="niufan-qnap-probe-")
+        try:
+            with open(os.path.join(probe_dir, "pwm1"), "w") as handle:
+                handle.write("155")
+            with open(os.path.join(probe_dir, "fan1_input"), "w") as handle:
+                handle.write("900")
+
+            class RespondingQnapChannel(fanhardware.FanChannel):
+                def write_duty(self, value):
+                    super().write_duty(value)
+                    rpm = int(value) * 1607 // 255  # 0% -> 0, 100% -> 1607
+                    with open(self.path_rpm, "w") as handle:
+                        handle.write(str(rpm))
+
+            responding = RespondingQnapChannel(probe_dir, 1, qnap)
+            real_results = fanhardware.probe_channels(
+                [responding], None, high_settle=0, low_settle=0, window=0.01)
+            real_entry = real_results[0]
+            check.case(real_entry["rpm_high"] == 1607
+                       and real_entry["rpm_low"] == 0
+                       and real_entry["responsive"],
+                       "标定在 100% / 0% 得到正确转速差")
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+    finally:
+        qnap.probe_settle = saved_settle
+
     return check.finish()
 
 
